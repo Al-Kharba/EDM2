@@ -94,17 +94,30 @@ class Conv2d(torch.nn.Module):
 
 @persistence.persistent_class
 class GroupNorm(torch.nn.Module):
-    def __init__(self, num_channels, num_groups=32, min_channels_per_group=4, eps=1e-5):
+    def __init__(self, num_channels, num_groups=32, min_channels_per_group=4, eps=1e-4):
         super().__init__()
         self.num_groups = min(num_groups, num_channels // min_channels_per_group)
         self.eps = eps
-        self.weight = torch.nn.Parameter(torch.ones(num_channels))
-        self.bias = torch.nn.Parameter(torch.zeros(num_channels))
+        self.weight = torch.ones(num_channels)
+        self.bias = torch.zeros(num_channels)
 
     def forward(self, x):
         x = torch.nn.functional.group_norm(x, num_groups=self.num_groups, weight=self.weight.to(x.dtype), bias=self.bias.to(x.dtype), eps=self.eps)
         return x
 
+#----------------------------------------------------------------------------
+# Pixel normalization.
+
+@persistence.persistent_class
+class PixelNorm(torch.nn.Module):
+    def __init__(self, eps=1e-4):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x):
+        x = x  / ((x**2).mean(dim=1, keepdims=True).sqrt()+self.eps)
+        return x
+    
 #----------------------------------------------------------------------------
 # Attention weight computation, i.e., softmax(Q^T * K).
 # Performs all computation using FP32, but uses the original datatype for
@@ -113,16 +126,16 @@ class GroupNorm(torch.nn.Module):
 class AttentionOp(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k):
-        w = torch.einsum('ncq,nck->nqk', q.to(torch.float32), (k / np.sqrt(k.shape[1])).to(torch.float32)).softmax(dim=2).to(q.dtype)
+        w = torch.einsum('ncq,nck->nqk', q, (k / np.sqrt(k.shape[1]))).softmax(dim=2)
         ctx.save_for_backward(q, k, w)
         return w
 
     @staticmethod
     def backward(ctx, dw):
         q, k, w = ctx.saved_tensors
-        db = torch._softmax_backward_data(grad_output=dw.to(torch.float32), output=w.to(torch.float32), dim=2, input_dtype=torch.float32)
-        dq = torch.einsum('nck,nqk->ncq', k.to(torch.float32), db).to(q.dtype) / np.sqrt(k.shape[1])
-        dk = torch.einsum('ncq,nqk->nck', q.to(torch.float32), db).to(k.dtype) / np.sqrt(k.shape[1])
+        db = torch._softmax_backward_data(grad_output=dw, output=w, dim=2, input_dtype=w.dtype)
+        dq = torch.einsum('nck,nqk->ncq', k, db) / np.sqrt(k.shape[1])
+        dk = torch.einsum('ncq,nqk->nck', q, db) / np.sqrt(k.shape[1])
         return dq, dk
 
 #----------------------------------------------------------------------------
@@ -134,8 +147,8 @@ class AttentionOp(torch.autograd.Function):
 class UNetBlock(torch.nn.Module):
     def __init__(self,
         in_channels, out_channels, emb_channels, up=False, down=False, attention=False,
-        num_heads=None, channels_per_head=64, dropout=0, skip_scale=1, eps=1e-5,
-        resample_filter=[1,1], resample_proj=False, adaptive_scale=True,
+        num_heads=None, channels_per_head=64, dropout=0, skip_scale=1, eps=1e-4,
+        resample_filter=[1,1], resample_proj=False,
         init=dict(), init_zero=dict(init_weight=0), init_attn=None,
     ):
         super().__init__()
@@ -145,11 +158,10 @@ class UNetBlock(torch.nn.Module):
         self.num_heads = 0 if not attention else num_heads if num_heads is not None else out_channels // channels_per_head
         self.dropout = dropout
         self.skip_scale = skip_scale
-        self.adaptive_scale = adaptive_scale
 
         self.norm0 = GroupNorm(num_channels=in_channels, eps=eps)
         self.conv0 = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=3, up=up, down=down, resample_filter=resample_filter, **init)
-        self.affine = Linear(in_features=emb_channels, out_features=out_channels*(2 if adaptive_scale else 1), **init)
+        self.affine = Linear(in_features=emb_channels, out_features=out_channels, **init)
         self.norm1 = GroupNorm(num_channels=out_channels, eps=eps)
         self.conv1 = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=3, **init_zero)
 
@@ -159,7 +171,7 @@ class UNetBlock(torch.nn.Module):
             self.skip = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=kernel, up=up, down=down, resample_filter=resample_filter, **init)
 
         if self.num_heads:
-            self.norm2 = GroupNorm(num_channels=out_channels, eps=eps)
+            self.norm2 = PixelNorm()
             self.qkv = Conv2d(in_channels=out_channels, out_channels=out_channels*3, kernel=1, **(init_attn if init_attn is not None else init))
             self.proj = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=1, **init_zero)
 
@@ -168,18 +180,17 @@ class UNetBlock(torch.nn.Module):
         x = self.conv0(silu(self.norm0(x)))
 
         params = self.affine(emb).unsqueeze(2).unsqueeze(3).to(x.dtype)
-        if self.adaptive_scale:
-            scale, shift = params.chunk(chunks=2, dim=1)
-            x = silu(torch.addcmul(shift, self.norm1(x), scale + 1))
-        else:
-            x = silu(self.norm1(x.add_(params)))
+        x = x.mul_(params+1)
 
         x = self.conv1(torch.nn.functional.dropout(x, p=self.dropout, training=self.training))
         x = x.add_(self.skip(orig) if self.skip is not None else orig)
         x = x * self.skip_scale
 
         if self.num_heads:
-            q, k, v = self.qkv(self.norm2(x)).reshape(x.shape[0] * self.num_heads, x.shape[1] // self.num_heads, 3, -1).unbind(2)
+            q, k, v = self.qkv(x).reshape(x.shape[0] * self.num_heads, x.shape[1] // self.num_heads, 3, -1).unbind(2)
+            q = self.norm2(q)
+            k = self.norm2(k)
+            v = self.norm2(v)
             w = AttentionOp.apply(q, k)
             a = torch.einsum('nqk,nck->ncq', w, v)
             x = self.proj(a.reshape(*x.shape)).add_(x)
@@ -219,6 +230,21 @@ class FourierEmbedding(torch.nn.Module):
         x = torch.cat([x.cos(), x.sin()], dim=1)
         return x
 
+#----------------------------------------------------------------------------
+# Timestep embedding used in EDM2.
+
+@persistence.persistent_class
+class FourierEmbedding2(torch.nn.Module):
+    def __init__(self, num_channels):
+        super().__init__()
+        self.register_buffer('freqs', torch.randn(num_channels))
+        self.register_buffer('phases', torch.rand(num_channels))
+
+    def forward(self, x):
+        x = x.ger((self.freqs).to(x.dtype)) + self.phases.unsqueeze(0)
+        x = 2 * np.pi * x 
+        return x.cos()
+    
 #----------------------------------------------------------------------------
 # Reimplementation of the DDPM++ and NCSN++ architectures from the paper
 # "Score-Based Generative Modeling through Stochastic Differential
@@ -388,12 +414,12 @@ class DhariwalUNet(torch.nn.Module):
         super().__init__()
         self.label_dropout = label_dropout
         emb_channels = model_channels * channel_mult_emb
-        init = dict(init_mode='kaiming_uniform', init_weight=np.sqrt(1/3), init_bias=np.sqrt(1/3))
-        init_zero = dict(init_mode='kaiming_uniform', init_weight=0, init_bias=0)
+        init = dict(init_mode='kaiming_uniform', init_weight=np.sqrt(1/3), bias=False)
+        init_zero = dict(init_mode='kaiming_uniform', init_weight=np.sqrt(1/3), bias=False)
         block_kwargs = dict(emb_channels=emb_channels, channels_per_head=64, dropout=dropout, init=init, init_zero=init_zero)
 
         # Mapping.
-        self.map_noise = PositionalEmbedding(num_channels=model_channels)
+        self.map_noise = FourierEmbedding2(num_channels=model_channels)
         self.map_augment = Linear(in_features=augment_dim, out_features=model_channels, bias=False, **init_zero) if augment_dim else None
         self.map_layer0 = Linear(in_features=model_channels, out_features=emb_channels, **init)
         self.map_layer1 = Linear(in_features=emb_channels, out_features=emb_channels, **init)
@@ -442,7 +468,7 @@ class DhariwalUNet(torch.nn.Module):
         emb = silu(self.map_layer0(emb))
         emb = self.map_layer1(emb)
         if self.map_label is not None:
-            tmp = class_labels
+            tmp = class_labels * np.sqrt(1000)
             if self.training and self.label_dropout:
                 tmp = tmp * (torch.rand([x.shape[0], 1], device=x.device) >= self.label_dropout).to(tmp.dtype)
             emb = emb + self.map_label(tmp)
@@ -651,10 +677,11 @@ class EDMPrecond(torch.nn.Module):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.sigma_data = sigma_data
-        self.model = globals()[model_type](img_resolution=img_resolution, in_channels=img_channels, out_channels=img_channels, label_dim=label_dim, **model_kwargs)
+        self.model = globals()[model_type](img_resolution=img_resolution, in_channels=img_channels+1, out_channels=img_channels, label_dim=label_dim, **model_kwargs)
 
     def forward(self, x, sigma, class_labels=None, force_fp32=False, **model_kwargs):
         x = x.to(torch.float32)
+        constant = torch.ones((x.shape[0], 1, x.shape[2], x.shape[3]), dtype=torch.float32, device=x.device)
         sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
         class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32).reshape(-1, self.label_dim)
         dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
@@ -664,7 +691,7 @@ class EDMPrecond(torch.nn.Module):
         c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
         c_noise = sigma.log() / 4
 
-        F_x, u = self.model((c_in * x).to(dtype), c_noise.flatten(), class_labels=class_labels, **model_kwargs)
+        F_x, u = self.model(torch.cat([c_in * x, constant], dim=1).to(dtype), c_noise.flatten(), class_labels=class_labels, **model_kwargs)
         assert F_x.dtype == dtype
         D_x = c_skip * x + c_out * F_x.to(torch.float32)
         if self.training:
