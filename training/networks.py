@@ -397,6 +397,7 @@ class DhariwalUNet(torch.nn.Module):
         self.map_augment = Linear(in_features=augment_dim, out_features=model_channels, bias=False, **init_zero) if augment_dim else None
         self.map_layer0 = Linear(in_features=model_channels, out_features=emb_channels, **init)
         self.map_layer1 = Linear(in_features=emb_channels, out_features=emb_channels, **init)
+        self.map_layeru = Linear(in_features=model_channels, out_features=1, **init)
         self.map_label = Linear(in_features=label_dim, out_features=emb_channels, bias=False, init_mode='kaiming_normal', init_weight=np.sqrt(label_dim)) if label_dim else None
 
         # Encoder.
@@ -435,6 +436,7 @@ class DhariwalUNet(torch.nn.Module):
     def forward(self, x, noise_labels, class_labels, augment_labels=None):
         # Mapping.
         emb = self.map_noise(noise_labels)
+        u = self.map_layeru(emb).unsqueeze(2).unsqueeze(3)
         if self.map_augment is not None and augment_labels is not None:
             emb = emb + self.map_augment(augment_labels)
         emb = silu(self.map_layer0(emb))
@@ -458,7 +460,7 @@ class DhariwalUNet(torch.nn.Module):
                 x = torch.cat([x, skips.pop()], dim=1)
             x = block(x, emb)
         x = self.out_conv(silu(self.out_norm(x)))
-        return x
+        return x, u
 
 #----------------------------------------------------------------------------
 # Preconditioning corresponding to the variance preserving (VP) formulation
@@ -662,10 +664,13 @@ class EDMPrecond(torch.nn.Module):
         c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
         c_noise = sigma.log() / 4
 
-        F_x = self.model((c_in * x).to(dtype), c_noise.flatten(), class_labels=class_labels, **model_kwargs)
+        F_x, u = self.model((c_in * x).to(dtype), c_noise.flatten(), class_labels=class_labels, **model_kwargs)
         assert F_x.dtype == dtype
         D_x = c_skip * x + c_out * F_x.to(torch.float32)
-        return D_x
+        if self.training:
+            return D_x, u
+        else:
+            return D_x
 
     def round_sigma(self, sigma):
         return torch.as_tensor(sigma)
