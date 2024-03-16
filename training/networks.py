@@ -21,7 +21,14 @@ def weight_init(shape, mode, fan_in, fan_out):
     if mode == 'xavier_normal':  return np.sqrt(2 / (fan_in + fan_out)) * torch.randn(*shape)
     if mode == 'kaiming_uniform': return np.sqrt(3 / fan_in) * (torch.rand(*shape) * 2 - 1)
     if mode == 'kaiming_normal':  return np.sqrt(1 / fan_in) * torch.randn(*shape)
+    if mode == 'normal': return torch.randn(*shape)
     raise ValueError(f'Invalid init mode "{mode}"')
+
+def weight_norm(x, eps=1e-4):
+    dim = list(range(1, x.ndim))
+    n = torch.linalg.vector_norm(x, dim=dim, keepdim=True)
+    alpha = np.sqrt(n.numel() / x.numel())
+    return x / torch.add(eps , n, alpha=alpha)
 
 #----------------------------------------------------------------------------
 # Fully-connected layer.
@@ -32,12 +39,17 @@ class Linear(torch.nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.fan_in = in_features
         init_kwargs = dict(mode=init_mode, fan_in=in_features, fan_out=out_features)
         self.weight = torch.nn.Parameter(weight_init([out_features, in_features], **init_kwargs) * init_weight)
         self.bias = torch.nn.Parameter(weight_init([out_features], **init_kwargs) * init_bias) if bias else None
 
     def forward(self, x):
-        x = x @ self.weight.to(x.dtype).t()
+        if self.training and self.weight is not None:
+            with torch.no_grad():
+                self.weight.copy_(weight_norm(self.weight))
+        w = weight_norm(self.weight).to(x.dtype) / np.sqrt(self.fan_in)
+        x = x @ w.t()
         if self.bias is not None:
             x = x.add_(self.bias.to(x.dtype))
         return x
@@ -58,6 +70,7 @@ class Conv2d(torch.nn.Module):
         self.up = up
         self.down = down
         self.fused_resample = fused_resample
+        self.fan_in = in_channels*kernel*kernel
         init_kwargs = dict(mode=init_mode, fan_in=in_channels*kernel*kernel, fan_out=out_channels*kernel*kernel)
         self.weight = torch.nn.Parameter(weight_init([out_channels, in_channels, kernel, kernel], **init_kwargs) * init_weight) if kernel else None
         self.bias = torch.nn.Parameter(weight_init([out_channels], **init_kwargs) * init_bias) if kernel and bias else None
@@ -66,7 +79,10 @@ class Conv2d(torch.nn.Module):
         self.register_buffer('resample_filter', f if up or down else None)
 
     def forward(self, x):
-        w = self.weight.to(x.dtype) if self.weight is not None else None
+        if self.training and self.weight is not None:
+            with torch.no_grad():
+                self.weight.copy_(weight_norm(self.weight))
+        w = weight_norm(self.weight).to(x.dtype) / np.sqrt(self.fan_in) if self.weight is not None else None
         b = self.bias.to(x.dtype) if self.bias is not None else None
         f = self.resample_filter.to(x.dtype) if self.resample_filter is not None else None
         w_pad = w.shape[-1] // 2 if w is not None else 0
@@ -414,8 +430,8 @@ class DhariwalUNet(torch.nn.Module):
         super().__init__()
         self.label_dropout = label_dropout
         emb_channels = model_channels * channel_mult_emb
-        init = dict(init_mode='kaiming_uniform', init_weight=np.sqrt(1/3), bias=False)
-        init_zero = dict(init_mode='kaiming_uniform', init_weight=np.sqrt(1/3), bias=False)
+        init = dict(init_mode='normal', init_weight=1, bias=False)
+        init_zero = dict(init_mode='normal', init_weight=1, bias=False)
         block_kwargs = dict(emb_channels=emb_channels, channels_per_head=64, dropout=dropout, init=init, init_zero=init_zero)
 
         # Mapping.
