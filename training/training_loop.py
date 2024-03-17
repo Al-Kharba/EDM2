@@ -37,6 +37,7 @@ def training_loop(
     ema_halflife_kimg   = 500,      # Half-life of the exponential moving average (EMA) of model weights.
     ema_rampup_ratio    = 0.05,     # EMA ramp-up coefficient, None = no rampup.
     lr_rampup_kimg      = 10000,    # Learning rate ramp-up duration.
+    lr_tref             = 1e8,      # .
     loss_scaling        = 1,        # Loss scaling factor for reducing FP16 under/overflows.
     kimg_per_tick       = 50,       # Interval of progress prints.
     snapshot_ticks      = 50,       # How often to save network snapshots, None = disable.
@@ -133,7 +134,11 @@ def training_loop(
 
         # Update weights.
         for g in optimizer.param_groups:
-            g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
+            rampup = min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
+            if rampup < 1:
+                g['lr'] = optimizer_kwargs['lr'] * rampup
+            elif cur_nimg > lr_tref * 1000:
+                g['lr'] = optimizer_kwargs['lr'] / np.sqrt(cur_nimg/(lr_tref*1000))
         for param in net.parameters():
             if param.grad is not None:
                 torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
