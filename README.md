@@ -1,4 +1,4 @@
-## Elucidating the Design Space of Diffusion-Based Generative Models (EDM)<br><sub>Official PyTorch implementation of the NeurIPS 2022 paper</sub>
+## Analyzing and Improving the Training Dynamics of Diffusion Models (EDM-2)<br><sub>Unofficial implementation based on the official [code](https://github.com/NVlabs/edm) of the first version</sub>
 
 ![Teaser image](./docs/teaser-1920x640.jpg)
 
