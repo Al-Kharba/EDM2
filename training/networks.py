@@ -11,7 +11,24 @@
 import numpy as np
 import torch
 from torch_utils import persistence
-from torch.nn.functional import silu
+from torch.nn.functional import silu_
+
+#----------------------------------------------------------------------------
+# Magnitude-preserving silu
+
+def silu(x):
+    return silu_(x)/0.596
+
+#----------------------------------------------------------------------------
+# Magnitude-preserving operations
+
+def mp_sum(x, skip, skip_w=0.5):
+    return (x * (1-skip_w)).add_(skip * skip_w)/np.sqrt(skip_w**2+(1-skip_w)**2)
+
+def mp_concat(x, skip, skip_w=0.5):
+    N_x = x.shape[1]
+    N_skip = skip.shape[1]
+    return torch.cat([x*(1-skip_w)/np.sqrt(N_x), skip*skip_w/np.sqrt(N_skip)], dim=1) * np.sqrt((N_x+N_skip)/(skip_w**2+(1-skip_w)**2))
 
 #----------------------------------------------------------------------------
 # Unified routine for initializing weights and biases.
@@ -188,6 +205,7 @@ class UNetBlock(torch.nn.Module):
 
         self.conv0 = Conv2d(in_channels=out_channels if encoder else in_channels, out_channels=out_channels, kernel=3, **init)
         self.affine = Linear(in_features=emb_channels, out_features=out_channels, **init)
+        self.gain = torch.nn.Parameter(torch.zeros((1, 1, 1, 1)))
         self.conv1 = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=3, **init_zero)
 
         if self.num_heads:
@@ -202,10 +220,11 @@ class UNetBlock(torch.nn.Module):
         x = self.conv0(silu(x))
 
         params = self.affine(emb).unsqueeze(2).unsqueeze(3).to(x.dtype)
+        params = params.mul_(self.gain.to(x.dtype))
         x = x.mul_(params+1)
 
         x = self.conv1(torch.nn.functional.dropout(silu(x), p=self.dropout, training=self.training))
-        x = x.add_(self.skip(orig) if self.skip is not None else orig)
+        x = mp_sum(x, self.skip(orig) if self.skip is not None else orig, skip_w=0.7)
         x = x * self.skip_scale
 
         if self.num_heads:
@@ -215,7 +234,7 @@ class UNetBlock(torch.nn.Module):
             v = self.norm1(v)
             w = AttentionOp.apply(q, k)
             a = torch.einsum('nqk,nck->ncq', w, v)
-            x = self.proj(a.reshape(*x.shape)).add_(x)
+            x = mp_sum(self.proj(a.reshape(*x.shape)), x, skip_w=0.7)
             x = x * self.skip_scale
         return x
 
@@ -265,7 +284,7 @@ class FourierEmbedding2(torch.nn.Module):
     def forward(self, x):
         x = x.ger((self.freqs).to(x.dtype)) + self.phases.unsqueeze(0)
         x = 2 * np.pi * x 
-        return x.cos()
+        return x.cos() * np.sqrt(2)
     
 #----------------------------------------------------------------------------
 # Reimplementation of the DDPM++ and NCSN++ architectures from the paper
@@ -479,6 +498,7 @@ class DhariwalUNet(torch.nn.Module):
                 self.dec[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=(res in attn_resolutions), **block_kwargs)
         self.out_norm = GroupNorm(num_channels=cout)
         self.out_conv = Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero)
+        self.gain = torch.nn.Parameter(torch.zeros((1, 1, 1, 1)))
 
     def forward(self, x, noise_labels, class_labels, augment_labels=None):
         # Mapping.
@@ -503,9 +523,10 @@ class DhariwalUNet(torch.nn.Module):
         # Decoder.
         for block in self.dec.values():
             if x.shape[1] != block.in_channels:
-                x = torch.cat([x, skips.pop()], dim=1)
+                x = mp_concat(x, skips.pop(), skip_w=0.5)
             x = block(x, emb)
         x = self.out_conv(x)
+        x = x * self.gain.to(x.dtype)
         return x, u
 
 #----------------------------------------------------------------------------
