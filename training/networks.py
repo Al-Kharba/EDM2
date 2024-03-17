@@ -518,6 +518,7 @@ class DhariwalUNet(torch.nn.Module):
         skips = []
         for block in self.enc.values():
             x = block(x, emb) if isinstance(block, UNetBlock) else block(x)
+            x = x.clamp(-256, 256)
             skips.append(x)
 
         # Decoder.
@@ -525,6 +526,7 @@ class DhariwalUNet(torch.nn.Module):
             if x.shape[1] != block.in_channels:
                 x = mp_concat(x, skips.pop(), skip_w=0.5)
             x = block(x, emb)
+            x = x.clamp(-256, 256)
         x = self.out_conv(x)
         x = x * self.gain.to(x.dtype)
         return x, u
