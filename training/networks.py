@@ -165,7 +165,7 @@ class UNetBlock(torch.nn.Module):
         in_channels, out_channels, emb_channels, up=False, down=False, attention=False,
         num_heads=None, channels_per_head=64, dropout=0, skip_scale=1, eps=1e-4,
         resample_filter=[1,1], resample_proj=False,
-        init=dict(), init_zero=dict(init_weight=0), init_attn=None,
+        init=dict(), init_zero=dict(init_weight=0), init_attn=None, encoder=False
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -175,38 +175,44 @@ class UNetBlock(torch.nn.Module):
         self.dropout = dropout
         self.skip_scale = skip_scale
 
-        self.norm0 = GroupNorm(num_channels=in_channels, eps=eps)
-        self.conv0 = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=3, up=up, down=down, resample_filter=resample_filter, **init)
-        self.affine = Linear(in_features=emb_channels, out_features=out_channels, **init)
-        self.norm1 = GroupNorm(num_channels=out_channels, eps=eps)
-        self.conv1 = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=3, **init_zero)
+        self.convin = None
+        if out_channels != in_channels or up or down:
+            kernel = 1 if resample_proj or out_channels != in_channels else 0
+            self.convin = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=kernel if encoder else 0, up=up, down=down, resample_filter=resample_filter, **init)
+
+        self.norm0 = PixelNorm(eps=eps) if encoder else None
 
         self.skip = None
-        if out_channels != in_channels or up or down:
-            kernel = 1 if resample_proj or out_channels!= in_channels else 0
-            self.skip = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=kernel, up=up, down=down, resample_filter=resample_filter, **init)
+        if out_channels != in_channels and not encoder:
+            self.skip = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=1, **init)
+
+        self.conv0 = Conv2d(in_channels=out_channels if encoder else in_channels, out_channels=out_channels, kernel=3, **init)
+        self.affine = Linear(in_features=emb_channels, out_features=out_channels, **init)
+        self.conv1 = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=3, **init_zero)
 
         if self.num_heads:
-            self.norm2 = PixelNorm()
+            self.norm1 = PixelNorm()
             self.qkv = Conv2d(in_channels=out_channels, out_channels=out_channels*3, kernel=1, **(init_attn if init_attn is not None else init))
             self.proj = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=1, **init_zero)
 
     def forward(self, x, emb):
+        x = self.convin(x) if self.convin is not None else x
+        x = self.norm0(x) if self.norm0 is not None else x
         orig = x
-        x = self.conv0(silu(self.norm0(x)))
+        x = self.conv0(silu(x))
 
         params = self.affine(emb).unsqueeze(2).unsqueeze(3).to(x.dtype)
         x = x.mul_(params+1)
 
-        x = self.conv1(torch.nn.functional.dropout(x, p=self.dropout, training=self.training))
+        x = self.conv1(torch.nn.functional.dropout(silu(x), p=self.dropout, training=self.training))
         x = x.add_(self.skip(orig) if self.skip is not None else orig)
         x = x * self.skip_scale
 
         if self.num_heads:
             q, k, v = self.qkv(x).reshape(x.shape[0] * self.num_heads, x.shape[1] // self.num_heads, 3, -1).unbind(2)
-            q = self.norm2(q)
-            k = self.norm2(k)
-            v = self.norm2(v)
+            q = self.norm1(q)
+            k = self.norm1(k)
+            v = self.norm1(v)
             w = AttentionOp.apply(q, k)
             a = torch.einsum('nqk,nck->ncq', w, v)
             x = self.proj(a.reshape(*x.shape)).add_(x)
@@ -438,7 +444,6 @@ class DhariwalUNet(torch.nn.Module):
         self.map_noise = FourierEmbedding2(num_channels=model_channels)
         self.map_augment = Linear(in_features=augment_dim, out_features=model_channels, bias=False, **init_zero) if augment_dim else None
         self.map_layer0 = Linear(in_features=model_channels, out_features=emb_channels, **init)
-        self.map_layer1 = Linear(in_features=emb_channels, out_features=emb_channels, **init)
         self.map_layeru = Linear(in_features=model_channels, out_features=1, **init)
         self.map_label = Linear(in_features=label_dim, out_features=emb_channels, bias=False, init_mode='kaiming_normal', init_weight=np.sqrt(label_dim)) if label_dim else None
 
@@ -452,11 +457,11 @@ class DhariwalUNet(torch.nn.Module):
                 cout = model_channels * mult
                 self.enc[f'{res}x{res}_conv'] = Conv2d(in_channels=cin, out_channels=cout, kernel=3, **init)
             else:
-                self.enc[f'{res}x{res}_down'] = UNetBlock(in_channels=cout, out_channels=cout, down=True, **block_kwargs)
+                self.enc[f'{res}x{res}_down'] = UNetBlock(in_channels=cout, out_channels=cout, down=True, encoder=True, **block_kwargs)
             for idx in range(num_blocks):
                 cin = cout
                 cout = model_channels * mult
-                self.enc[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=(res in attn_resolutions), **block_kwargs)
+                self.enc[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=(res in attn_resolutions), encoder=True, **block_kwargs)
         skips = [block.out_channels for block in self.enc.values()]
 
         # Decoder.
@@ -481,8 +486,7 @@ class DhariwalUNet(torch.nn.Module):
         u = self.map_layeru(emb).unsqueeze(2).unsqueeze(3)
         if self.map_augment is not None and augment_labels is not None:
             emb = emb + self.map_augment(augment_labels)
-        emb = silu(self.map_layer0(emb))
-        emb = self.map_layer1(emb)
+        emb = self.map_layer0(emb)
         if self.map_label is not None:
             tmp = class_labels * np.sqrt(1000)
             if self.training and self.label_dropout:
@@ -501,7 +505,7 @@ class DhariwalUNet(torch.nn.Module):
             if x.shape[1] != block.in_channels:
                 x = torch.cat([x, skips.pop()], dim=1)
             x = block(x, emb)
-        x = self.out_conv(silu(self.out_norm(x)))
+        x = self.out_conv(x)
         return x, u
 
 #----------------------------------------------------------------------------
